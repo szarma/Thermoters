@@ -1,0 +1,385 @@
+## Definitions:
+import pandas as pd
+from collections import OrderedDict
+import numpy as np
+from copy import deepcopy
+from general_functions import tally,mode
+split_fractions = np.array([.6, .2, .2])
+assert split_fractions.sum() == 1
+split_names = ["train", "test", "eval"]
+rbseq = "aggag"
+lstrip  = 0  
+rstrip  = 14+20
+rndSeed = 1
+allData = ["Pr","Pl","mag"]
+
+try:
+    from scipy.special import logsumexp
+except:
+    from scipy.misc import logsumexp
+
+def getBricks(twoMatrices,
+              minSpacer,
+              spacerPenalties,
+              sequences,
+              makeLengthConsistent=False):
+
+    n1, n2 = [m.shape[0] for m in twoMatrices]
+    nSpacer = len(spacerPenalties)
+    nSeq, seqL = sequences.shape
+    
+    energyBoxes = np.array([
+        slideSingleMatrix(twoMatrices[0], sequences[:,              : seqL-n2-minSpacer]).T,
+        slideSingleMatrix(twoMatrices[1], sequences[:, n1+minSpacer :                  ]).T
+                  ])
+    if makeLengthConsistent:    
+        # works only if the center spacer Penalty is 0
+        spFlex = nSpacer//2
+        assert spacerPenalties[spFlex]==0
+        Lmatrix = minSpacer+n1+n2+spFlex
+        Lbrick = seqL-Lmatrix+1
+        effergies = np.ones((nSpacer,Lbrick,nSeq))*100  # large number so it vanishes when exp(-#)
+        for iS in range(nSpacer):
+            try:
+                tmp =  energyBoxes[0,:energyBoxes.shape[1]-iS]\
+                                   +energyBoxes[1,iS:]\
+                                   +spacerPenalties[iS]
+    #             print (tmp.shape,Lbrick)
+                tmp = tmp[-Lbrick:]
+                effergies[iS][-tmp.shape[0]:] = tmp
+            except:
+                pass
+    else:
+        effergies = [np.array(  energyBoxes[0,:energyBoxes.shape[1]-iS] # in fact it is like next line, but the zeroth element
+                             # +energyBoxes[0,  :-iS]
+                               +energyBoxes[1,iS:]
+                               +spacerPenalties[iS])
+                     for iS in range(nSpacer)]
+        # to align the sequences by right-flushing
+        effergies = np.array([effergies[iS][nSpacer-iS:] for iS in range(nSpacer)])
+
+##################################################
+##################################################
+    return effergies
+    
+def brick2lps(bricks_DNIs,
+              fitpars,
+              thresholdPosDict_ = None,
+              bindMode_     = None,
+             ):
+    out = {}               
+    if thresholdPosDict_ is None:
+        thresholdPosDict_ = fitpars["ThDict"]
+    if bindMode_ is None:
+        bindMode_ = fitpars["bindMode"]
+    R_ = np.exp(fitpars.get("clearanceRate",-np.inf))
+    for dataID_ in bricks_DNIs:
+        if "_rc" in dataID_: continue
+        bdni         = bricks_DNIs      [dataID_]
+        thresholdPos = thresholdPosDict_.get(dataID_,thresholdPosDict_["Prl"])
+        if thresholdPos<=0:
+            thresholdPos = bdni.shape[1]+thresholdPos
+#         print (dataID_, thresholdPos)
+        off = thresholdPos<bdni.shape[1]
+        if bindMode_ == "add":
+#             bindF = lambda xi: -logsumexp(-xi,axis=tuple(range(1,xi.ndim)))
+            bindF = lambda xi: -np.log(np.sum(
+                                1./(np.exp(xi)+R_),
+                                axis=tuple(range(1,xi.ndim))
+                                        ))
+        if bindMode_ == "max":
+            bindF = lambda xi: np.min(xi,axis=tuple(range(1,xi.ndim)))
+        effON_  =     bindF(bdni[:,:thresholdPos])
+        if off:
+            effOFF_ = bindF(bdni[:,thresholdPos:])
+        else:
+            effOFF_ = 0.
+        if dataID_+"_rc" in bricks_DNIs:
+            bdni_rc = bricks_DNIs[dataID_+"_rc"]
+            rcOcclusion = fitpars.get("rcOcclusion",np.arange(bdni_rc.shape[1]))
+            effOFF_ += bindF(bdni_rc[:,rcOcclusion])
+        Pons_ = np.exp(-effON_)/(1.+np.exp(-effON_)+np.exp(-effOFF_))
+        out[dataID_] = np.log10(Pons_)
+    return out
+    
+def slideSingleMatrix(m, seqs):
+    Lout = seqs.shape[1]-m.shape[0]+1
+    return np.array([bindingEnergies(m,seqs[:,offset:offset+m.shape[0]]) for offset in range(Lout)]).T
+
+def randomize(iBootStr):
+    global numDataDict, lums, digiLums, seqs, weights
+    for k in numDataDict[nfit].keys():
+        if "train_b" in k or "test_b" in k:
+            del numDataDict[nfit][k]
+    for tt in ["train_b_%i"%iBootStr, "test_b_%i"%iBootStr]:
+        numDataDict[nfit][tt] = {}#dataID:{} for dataID in allData
+    for dataID in allData:
+        curdata = pd.DataFrame(DataDict[dataID])
+        Ntrain = (curdata["data split"].values=="train").sum()
+        Nbins = int(np.round(curdata['expr']).max()+1)
+        np.random.seed(iBootStr)
+        iperm = np.random.permutation(curdata.index)
+        tagDict = {
+            "train_b_%i"%iBootStr: iperm[:Ntrain],
+             "test_b_%i"%iBootStr: iperm[Ntrain:]
+        }
+        
+        for tt in tagDict:
+            data = curdata.loc[tagDict[tt]]
+            seqs = np.array([
+                [lett_to_index[l] for l in s[lstrip:-rstrip]] for s in data['sequence']
+            ])
+            lums = np.array(data['expr'].values)
+#             print (dataID,Ntrain,tt,len(tagDict[tt]),seqs.shape,lums.mean())
+            np.random.seed(rndSeed)
+            jitter = (np.random.rand(len(lums))-.5)*1e-9
+            digiLums = np.round(lums+jitter).astype(int)
+            weights = np.nan*np.ones_like(lums)
+            for jb in range(Nbins):
+                fltr = digiLums==jb
+                if sum(fltr):
+                    weights[fltr] = 1./sum(fltr)
+            weights /= weights.sum()
+            weights *= len(weights)
+            numDataDict[nfit][tt][dataID] = {col:eval(col) for col in ["seqs","lums","digiLums","weights"]}
+
+def lps2eval(fitpar, objF,
+             DataIDs_   = None,
+             tt         = "train",
+             fit        = None,
+             logPonDict_= None,
+             bricks_    = None,
+             binEdges_  = None,
+#              forceBE_   = 1
+             ax = None,
+             dinucl = False,
+             dinuCoordsAndValues = None
+             ):
+    if DataIDs_ is None:
+        DataIDs_ = fitpar["DataIDs"]
+    if fit is None:
+        fit = "train" in tt
+    data_ = numDataDict[fitpar["Nfit"]][tt]
+    if logPonDict_ is None:
+        if bricks_ is None:
+            bricks_ = getBrickDict( {did: data_[did]["seqs"] for did in DataIDs_}, fitpar, dinucl=dinucl, dinuCoordsAndValues = dinuCoordsAndValues)
+        esc = fitpar["en.scale"]
+        logPonDict_ = brick2lps( {el: bricks_[el]*esc for el in bricks_ }, fitpar)
+    out = {}
+        
+    for dataID_ in DataIDs_:
+        seqs_     =       data_[dataID_]["seqs"]
+        digiLums_ =       data_[dataID_]["digiLums"]
+        weights_  =       data_[dataID_]["weights"]
+        Ndata_    =   len(data_[dataID_]["weights"])
+        logPon_   = logPonDict_[dataID_].reshape(-1,1)
+        if not np.all(np.isfinite(logPon_)):
+            if objF=="mlogL":
+                out[dataID_] = np.inf
+            else:
+                out[dataID_] = np.nan
+            continue
+        try:
+            logisticRegression = fitpar["logisticRegression"]
+        except:
+            print ("Warning: about to touch the main Logistic regrassion for ",dataID_)
+            logisticRegression = LogRegression
+        if logisticRegression.has_key(dataID_):
+            LR_ = logisticRegression[dataID_]
+        else:
+            LR_ = logisticRegression["Prl"]
+        if fit:
+            LR_.fit( logPon_, digiLums_, sample_weight=weights_)
+        if objF=="mlogL":
+            out[dataID_] = -(LR_.predict_log_proba(logPon_)[range(Ndata_),digiLums_]*weights_).sum()
+        if objF=="linR2":
+            lums = data_[dataID_]["lums"]
+#             if fit:
+            LinReg.fit(logPon_,lums,sample_weight=weights_)
+            out[dataID_] = LinReg.score(logPon_,lums,sample_weight=weights_)
+            
+        if objF=="c1ln" or ax is not None:
+            lums = data_[dataID_]["lums"]
+            inferEdges = -np.diff(LR_.intercept_)/np.diff(LR_.coef_.flatten())
+            try: ax.inferredEdges = inferEdges
+            except: pass
+            realEdge   = np.arange(digiLums_.max())+.5
+            k = (1./np.diff(binEdges[dataID_][-10:])).mean()
+            offset_ = np.mean((realEdge-k*inferEdges)[-10:])
+            minV = 0 if dataID_[0]=="P" else 1
+            logPon_pred = np.clip(logPon_.flatten()*k + offset_, minV, digiLums_.max())
+            
+        if objF=="c1ln":
+            errs = logPon_pred - lums
+            wmse = sum(weights_*errs**2)/weights_.sum()
+            lums_mean = np.sum(lums*weights_)/weights_.sum()
+            wvar = sum(weights_*(lums-lums_mean)**2)/weights_.sum()
+            out[dataID_] = 1-wmse/wvar
+
+        if objF=="r2":
+            lums = data_[dataID_]["lums"]
+            errs = LR_.predict(logPon_)-lums
+            wmse = sum(weights_*errs**2)/weights_.sum()
+            lums_mean = np.sum(lums*weights_)/weights_.sum()
+            wvar = sum(weights_*(lums-lums_mean)**2)/weights_.sum()
+            out[dataID_] = 1-wmse/wvar
+
+        if objF=="r2_no_weights":
+            lums = data_[dataID_]["lums"]
+            errs = LR_.predict(logPon_)-lums
+            weights_ = np.ones_like(lums)
+            wmse = sum(weights_*errs**2)/weights_.sum()
+            lums_mean = np.sum(lums*weights_)/weights_.sum()
+            wvar = sum(weights_*(lums-lums_mean)**2)/weights_.sum()
+            out[dataID_] = 1-wmse/wvar
+#             print (wvar)
+        if ax is not None:
+            ax.plot(inferEdges,realEdge,"ko", zorder=10)
+            for b in realEdge:
+                ax.axhline(b, lw=.3,color="r")
+            for b in inferEdges:
+                ax.axvline(b, lw=.3,color="r")
+            ax.plot(logPon_,lums,"x",ms=4)
+            ax.plot(logPon_,logPon_pred,".", ms=1)
+    return out 
+
+
+def importData():
+    global DataDict, AncestorDict, RBSPosDict
+
+    DataDict = {}
+    AncestorDict = {}
+    RBSPosDict = {}
+    for dataID in allData:
+        if dataID=="mag":
+            data = pd.read_csv(dataDir+"filter_data_sorted.csv")
+            data.rename(columns={"expr_bin_units": "expr"}, inplace=True)
+        else:
+#             covTh = 10
+            act = 0
+            data = pd.read_csv(dataDir+"%s_%i_filtered.csv"%(dataID,act), index_col=0)
+            data.rename(columns={"Coverage": "coverage"}, inplace=True)
+            data["expr"] = data["Median"]
+        data = data[data["coverage"]>=30]
+        data["data split"] = ""
+        Ndata = len(data)
+        cut_indices = np.cumsum(split_fractions*Ndata)[:-1].astype(int)
+        np.random.seed(rndSeed)
+        rnd_idx = np.random.permutation(data.index)
+        splits = np.split(rnd_idx,cut_indices)
+        for name, idx in zip(split_names, splits):
+            data.loc[idx,"data split"] = name
+        assert len(tally(map(len,data.sequence)))==1
+        ancestor = "".join(map(mode,np.array(map(list,data.sequence)).T))
+        AncestorDict[dataID] = ancestor[lstrip:-rstrip]
+        rbsPos = ancestor.find(rbseq)-lstrip
+        if rbsPos<1:
+            rbsPos = -1
+        RBSPosDict[dataID] = rbsPos
+        DataDict[dataID] = deepcopy(data)
+
+def createNumData(tts=split_names):
+    global numDataDict
+    numDataDict = {}
+    for nfit in ["442"]:
+        numDataDict[nfit] = OrderedDict([(k,OrderedDict()) for k in tts])
+        for dataID in allData:
+            Nbins = int(np.round(DataDict[dataID]['expr']).max()+1)
+            for tt in tts:
+                if tt=="all":
+                    data = DataDict[dataID]
+                else:
+                    fltr = DataDict[dataID]["data split"].isin(tt.split("+"))
+                    data = DataDict[dataID][ fltr ]
+                seqs = np.array([
+                    [lett_to_index[l] for l in s[lstrip:-rstrip]] for s in data['sequence']
+                ])
+                lums = data['expr']
+                np.random.seed(rndSeed)
+                jitter = (np.random.rand(len(lums))-.5)*1e-9
+                digiLums = np.round(lums+jitter).astype(int)
+                weights = np.nan*np.ones_like(lums)
+                for jb in range(Nbins):
+                    fltr = digiLums==jb
+                    if sum(fltr):
+                        weights[fltr] = 1./sum(fltr)
+                weights /= weights.sum()
+                weights *= len(weights)
+                numDataDict[nfit][tt][dataID] = {
+                    "seqs":seqs,
+                    "lums":lums,
+                    "digiLums":digiLums,
+                    "weights":weights
+                }
+
+    for tt in numDataDict[nfit]:
+        numDataDict["442"][tt]["Prl"] = {}
+        for k in numDataDict["442"][tt]["Pr"]:
+            if k=="weights": continue
+            try:
+                numDataDict["442"][tt]["Prl"][k] = np.vstack([numDataDict["442"][tt][did][k] for did in ["Pr","Pl"]])
+            except:
+                numDataDict["442"][tt]["Prl"][k] = np.hstack([numDataDict["442"][tt][did][k] for did in ["Pr","Pl"]])
+        digiLums = numDataDict["442"][tt]["Prl"]["digiLums"]
+        weights = np.nan*np.ones_like(digiLums)
+        Nbins = digiLums.max()+1
+        for jb in range(Nbins):
+            fltr = digiLums==jb
+            if sum(fltr):
+                weights[fltr] = 1./sum(fltr)
+        weights /= weights.sum()
+        weights *= len(weights)
+        numDataDict["442"][tt]["Prl"]["weights"] = weights
+
+def getBrickDict(seqDict,mdl,dinucl=False,subtractChemPot=True,
+                 makeLengthConsistent=False,
+                 dinuCoordsAndValues = None):
+    if dinucl:
+        if dinuCoordsAndValues is None:
+            dinuCoords, dinuValues = dinuDF.index,dinuDF["median"].values
+        else:
+            dinuCoords, dinuValues = dinuCoordsAndValues
+    out = OrderedDict()
+    strands = [0]
+    if mdl["includeRC"]:
+        strands += [1]
+    for did in seqDict:
+        for strand in strands:
+            sq = seqDict[did]
+            if strand:
+                sq = 3-sq[:,::-1].copy(order="C")
+            tmp = getBricks(
+                mdl["matrices"],
+                mdl["min.spacer"],
+                mdl["sp.penalties"],
+                sq,
+                makeLengthConsistent=makeLengthConsistent).T
+            if subtractChemPot:
+                tmp += -mdl["chem.pot"].get(did,mdl["chem.pot"]["Prl"])
+            if dinucl:
+                tmpDn = np.array([
+                    getDiNu(*coord,
+                        n1=mdl["matrices"][0].shape[0],
+                        minSpacer=mdl["min.spacer"],
+                        n2=mdl["matrices"][1].shape[0],
+                        sequences=sq,
+                        nSpacer=len(mdl["sp.penalties"])).T
+                    for coord in dinuCoords])
+                tmp += np.array(tensum(dinuValues,tmpDn))
+            if strand:
+                tmp = tmp[:,::-1]
+            out[did+"_rc"*strand] = tmp
+    return out
+    
+def reprBigM(theFitPars):
+    Lspacer = theFitPars["Layout"][1]
+    ms = [m-np.repeat(m.min(axis=1),4).reshape(-1,4) for m in theFitPars["matrices"]]
+    bigM = np.vstack([ms[0]]+
+              [np.ones((1,4))*np.nan]*Lspacer+
+              [ms[1]]
+             )
+    return bigM
+
+def showdf(a_):
+    from IPython.display import display
+    display(a_.applymap("{0:0.1f}".format).style.set_properties(**{'text-align': 'right'}))
